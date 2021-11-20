@@ -1,5 +1,4 @@
 all: example
-	rm -rf out
 	./example
 
 example: ../zipper.h example.cpp
