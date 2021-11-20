@@ -14,6 +14,7 @@
 #include <minizip/zip.h>
 
 #include <cassert>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <vector>
@@ -45,10 +46,10 @@ class Zip {
     }
   }
 
-  bool add_file(const std::string &filename) {
+  bool add_file(const std::string &path) {
     assert(zfile_);
 
-    std::ifstream f(filename);
+    std::ifstream f(path);
     if (!f) {
       return false;
     }
@@ -58,7 +59,7 @@ class Zip {
     f.seekg(0, f.beg);
 
     auto ret = zipOpenNewFileInZip64(
-        zfile_, filename.data(), nullptr, nullptr, 0, nullptr, 0, nullptr,
+        zfile_, path.data(), nullptr, nullptr, 0, nullptr, 0, nullptr,
         Z_DEFLATED, Z_DEFAULT_COMPRESSION, (flen > 0xffffffff) ? 1 : 0);
 
     if (ret != ZIP_OK) {
@@ -160,7 +161,7 @@ class UnZip {
     });
   }
 
-  std::string filename() const {
+  std::string file_path() const {
     assert(uzfile_);
 
     char name[ZIPPER_MAX_NAMELEN];
@@ -196,7 +197,7 @@ class UnZip {
     return unzGoToNextFile(uzfile_) == UNZ_OK;
   }
 
-  uint64_t filesize() const {
+  uint64_t file_size() const {
     assert(uzfile_);
 
     unz_file_info64 finfo;
@@ -214,5 +215,19 @@ class UnZip {
  private:
   unzFile uzfile_ = nullptr;
 };
+
+template <typename T>
+inline bool enumerate(const std::string &zipname, T callback) {
+  UnZip unzip;
+  if (!unzip.open(zipname)) {
+    return false;
+  }
+  if (!unzip.file_path().empty()) {
+    do {
+      callback(unzip);
+    } while (unzip.skip_file());
+  }
+  return true;
+}
 
 };  // namespace zipper
