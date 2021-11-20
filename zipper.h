@@ -13,8 +13,10 @@
 #include <minizip/unzip.h>
 #include <minizip/zip.h>
 
+#include <cassert>
 #include <functional>
 #include <string>
+#include <vector>
 
 #define ZIPPER_BUF_SIZE 8192
 #define ZIPPER_MAX_NAMELEN 256
@@ -26,11 +28,11 @@ using read_cb_t = std::function<void(const unsigned char *buf, size_t size)>;
 class Zip {
  public:
   Zip() = default;
-  Zip(const char *zipname) { open(zipname); }
+  Zip(const std::string &zipname) { open(zipname); }
   ~Zip() { close(); }
 
-  bool open(const char *zipname) {
-    zfile_ = zipOpen64(zipname, 0);
+  bool open(const std::string &zipname) {
+    zfile_ = zipOpen64(zipname.data(), 0);
     return is_open();
   }
 
@@ -43,74 +45,71 @@ class Zip {
     }
   }
 
-  bool add_file(const char *filename) {
-    if (zfile_ == nullptr || filename == nullptr) return false;
+  bool add_file(const std::string &filename) {
+    assert(zfile_);
 
-    auto f = fopen(filename, "r");
-    if (f == nullptr) return false;
-
-    fseek(f, 0, SEEK_END);
-    auto flen = ftell(f);
-    rewind(f);
-
-    auto ret = zipOpenNewFileInZip64(
-        zfile_, filename, nullptr, nullptr, 0, nullptr, 0, nullptr, Z_DEFLATED,
-        Z_DEFAULT_COMPRESSION, (flen > 0xffffffff) ? 1 : 0);
-    if (ret != ZIP_OK) {
-      fclose(f);
+    std::ifstream f(filename);
+    if (!f) {
       return false;
     }
 
-    unsigned char buf[ZIPPER_BUF_SIZE];
-    size_t red;
-
-    while ((red = fread(buf, sizeof(*buf), sizeof(buf), f)) > 0) {
-      ret = zipWriteInFileInZip(zfile_, buf, red);
-      if (ret != ZIP_OK) {
-        fclose(f);
-        zipCloseFileInZip(zfile_);
-        return false;
-      }
-    }
-
-    zipCloseFileInZip(zfile_);
-    return true;
-  }
-
-  bool add_buf(const char *zfilename, const unsigned char *buf, size_t buflen) {
-    if (zfile_ == nullptr || buf == nullptr || buflen == 0) return false;
+    f.seekg(0, f.end);
+    auto flen = f.tellg();
+    f.seekg(0, f.beg);
 
     auto ret = zipOpenNewFileInZip64(
-        zfile_, zfilename, nullptr, nullptr, 0, nullptr, 0, nullptr, Z_DEFLATED,
-        Z_DEFAULT_COMPRESSION, (buflen > 0xffffffff) ? 1 : 0);
-    if (ret != ZIP_OK) return false;
+        zfile_, filename.data(), nullptr, nullptr, 0, nullptr, 0, nullptr,
+        Z_DEFLATED, Z_DEFAULT_COMPRESSION, (flen > 0xffffffff) ? 1 : 0);
+
+    if (ret != ZIP_OK) {
+      return false;
+    }
+
+    std::vector<char> buf(flen);
+    f.read(&buf[0], buf.size());
+    ret = zipWriteInFileInZip(zfile_, buf.data(), buf.size());
+
+    zipCloseFileInZip(zfile_);
+    return ret == ZIP_OK;
+  }
+
+  bool add_buf(const std::string &zfilename, const unsigned char *buf,
+               size_t buflen) {
+    assert(zfile_ && buf && buflen > 0);
+
+    auto ret = zipOpenNewFileInZip64(
+        zfile_, zfilename.data(), nullptr, nullptr, 0, nullptr, 0, nullptr,
+        Z_DEFLATED, Z_DEFAULT_COMPRESSION, (buflen > 0xffffffff) ? 1 : 0);
+
+    if (ret != ZIP_OK) {
+      return false;
+    }
 
     ret = zipWriteInFileInZip(zfile_, buf, buflen);
+
     zipCloseFileInZip(zfile_);
     return ret == ZIP_OK ? true : false;
   }
 
-  bool add_dir(const char *dirname) {
-    if (zfile_ == nullptr || dirname == nullptr || *dirname == '\0')
-      return false;
+  bool add_dir(std::string dirname) {
+    assert(zfile_ && !dirname.empty());
 
-    auto len = strlen(dirname);
-    auto temp = static_cast<char *>(calloc(1, len + 2));
-    memcpy(temp, dirname, len + 2);
-    if (temp[len - 1] != '/') {
-      temp[len] = '/';
-      temp[len + 1] = '\0';
-    } else {
-      temp[len] = '\0';
+    if (dirname.back() != '/') {
+      dirname += '/';
     }
 
-    auto ret = zipOpenNewFileInZip64(zfile_, temp, nullptr, nullptr, 0, nullptr,
-                                     0, nullptr, 0, 0, 0);
-    if (ret != ZIP_OK) return false;
-    free(temp);
+    auto ret = zipOpenNewFileInZip64(zfile_, dirname.data(), nullptr, nullptr,
+                                     0, nullptr, 0, nullptr, 0, 0, 0);
+
+    if (ret != ZIP_OK) {
+      return false;
+    }
+
     zipCloseFileInZip(zfile_);
     return ret == ZIP_OK ? true : false;
   }
+
+  operator zipFile() { return zfile_; }
 
  private:
   zipFile zfile_ = nullptr;
@@ -119,11 +118,11 @@ class Zip {
 class UnZip {
  public:
   UnZip() = default;
-  UnZip(const char *zipname) { open(zipname); }
+  UnZip(const std::string &zipname) { open(zipname); }
   ~UnZip() { close(); }
 
-  bool open(const char *zipname) {
-    uzfile_ = unzOpen64(zipname);
+  bool open(const std::string &zipname) {
+    uzfile_ = unzOpen64(zipname.data());
     return is_open();
   }
 
@@ -137,10 +136,12 @@ class UnZip {
   }
 
   bool read(read_cb_t cb) const {
-    if (uzfile_ == nullptr) return false;
+    assert(uzfile_);
 
     auto ret = unzOpenCurrentFile(uzfile_);
-    if (ret != UNZ_OK) return false;
+    if (ret != UNZ_OK) {
+      return false;
+    }
 
     unsigned char tbuf[ZIPPER_BUF_SIZE];
     int red;
@@ -149,13 +150,8 @@ class UnZip {
       cb(tbuf, red);
     }
 
-    if (red < 0) {
-      unzCloseCurrentFile(uzfile_);
-      return false;
-    }
-
     unzCloseCurrentFile(uzfile_);
-    return true;
+    return red >= 0;
   }
 
   bool read_buf(std::string &buf) const {
@@ -165,51 +161,55 @@ class UnZip {
   }
 
   std::string filename() const {
-    if (uzfile_ == nullptr) return nullptr;
+    assert(uzfile_);
 
     char name[ZIPPER_MAX_NAMELEN];
     unz_file_info64 finfo;
 
     auto ret = unzGetCurrentFileInfo64(uzfile_, &finfo, name, sizeof(name),
                                        nullptr, 0, nullptr, 0);
-    if (ret != UNZ_OK) return nullptr;
+    if (ret != UNZ_OK) {
+      return nullptr;
+    }
 
     return name;
   }
 
   bool isdir() const {
-    if (uzfile_ == nullptr) return false;
+    assert(uzfile_);
 
     char name[ZIPPER_MAX_NAMELEN];
     unz_file_info64 finfo;
 
     auto ret = unzGetCurrentFileInfo64(uzfile_, &finfo, name, sizeof(name),
                                        nullptr, 0, nullptr, 0);
-    if (ret != UNZ_OK) return false;
+    if (ret != UNZ_OK) {
+      return false;
+    }
 
     auto len = strlen(name);
-    if (finfo.uncompressed_size == 0 && len > 0 && name[len - 1] == '/')
-      return true;
-    return false;
+    return finfo.uncompressed_size == 0 && len > 0 && name[len - 1] == '/';
   }
 
   bool skip_file() const {
-    if (unzGoToNextFile(uzfile_) != UNZ_OK) return false;
-    return true;
+    assert(uzfile_);
+    return unzGoToNextFile(uzfile_) == UNZ_OK;
   }
 
   uint64_t filesize() const {
-    if (uzfile_ == nullptr) return 0;
+    assert(uzfile_);
 
     unz_file_info64 finfo;
     auto ret = unzGetCurrentFileInfo64(uzfile_, &finfo, nullptr, 0, nullptr, 0,
                                        nullptr, 0);
-    if (ret != UNZ_OK) return 0;
+    if (ret != UNZ_OK) {
+      return 0;
+    }
 
     return finfo.uncompressed_size;
   }
 
-  operator unzFile() const { return uzfile_; }
+  operator unzFile() { return uzfile_; }
 
  private:
   unzFile uzfile_ = nullptr;
