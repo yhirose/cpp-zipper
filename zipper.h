@@ -165,9 +165,7 @@ class UnZip {
     return finfo.uncompressed_size == 0 && len > 0 && name[len - 1] == '/';
   }
 
-  bool is_file() const {
-    return !is_dir();
-  }
+  bool is_file() const { return !is_dir(); }
 
   bool next() const {
     assert(uzfile_);
@@ -187,6 +185,15 @@ class UnZip {
     return finfo.uncompressed_size;
   }
 
+  template <typename T>
+  void enumerate(T callback) {
+    if (!file_path().empty()) {
+      do {
+        callback(*this);
+      } while (next());
+    }
+  }
+
   operator unzFile() { return uzfile_; }
 
  private:
@@ -196,15 +203,11 @@ class UnZip {
 template <typename T>
 inline bool enumerate(const std::string &zipname, T callback) {
   UnZip unzip;
-  if (!unzip.open(zipname)) {
-    return false;
+  if (unzip.open(zipname)) {
+    unzip.enumerate(callback);
+    return true;
   }
-  if (!unzip.file_path().empty()) {
-    do {
-      callback(unzip);
-    } while (unzip.next());
-  }
-  return true;
+  return false;
 }
 
 };  // namespace zipper
