@@ -75,7 +75,7 @@ class Zip {
       return false;
     }
 
-    ret = zipWriteInFileInZip(zfile_, data, len);
+    ret = zipWriteInFileInZip(zfile_, data, static_cast<unsigned int>(len));
 
     zipCloseFileInZip(zfile_);
     return ret == ZIP_OK ? true : false;
@@ -143,7 +143,7 @@ class UnZip {
     auto ret = unzGetCurrentFileInfo64(uzfile_, &finfo, name, sizeof(name),
                                        nullptr, 0, nullptr, 0);
     if (ret != UNZ_OK) {
-      return nullptr;
+      return std::string();
     }
 
     return name;
