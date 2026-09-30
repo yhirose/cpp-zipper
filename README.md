@@ -55,6 +55,53 @@ int main() {
 }
 ```
 
+In memory
+---------
+
+An archive can be read from bytes already in memory, and written to memory
+instead of a file. `open_memory(data, size)` does not copy the bytes, so they
+must outlive the `UnZip`.
+
+```cpp
+std::string bytes;
+{
+  zipper::Zip zip;
+  zip.open_memory();
+  zip.add_file("hello.txt", "Hello, world!");
+  zip.close();                 // the archive is complete once close() returns
+  bytes = zip.buffer();
+}
+
+zipper::UnZip unzip;
+unzip.open_memory(bytes.data(), bytes.size());
+if (unzip.locate("hello.txt")) {  // find an entry by name
+  std::string text;
+  unzip.read(text);
+}
+```
+
+Errors
+------
+
+Every call that can fail returns `false` and leaves the reason in `error()`:
+a file that cannot be opened, bytes that are not a ZIP archive, an entry that
+is not there, one that is encrypted or compressed with a method other than
+stored or deflate, or data that does not match its CRC.
+
+```cpp
+zipper::UnZip unzip;
+if (!unzip.open("archive.zip")) {
+  std::cerr << unzip.error() << std::endl;
+}
+```
+
+Tests
+-----
+
+```sh
+cd example && make
+```
+
 License
 -------
 
