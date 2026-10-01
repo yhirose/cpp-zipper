@@ -45,6 +45,7 @@ inline uLong ZCALLBACK mem_read(voidpf, voidpf stream, void *buf, uLong size) {
   auto s = static_cast<MemoryStream *>(stream);
   auto avail = s->pos < s->size ? s->size - s->pos : 0;
   auto n = static_cast<size_t>(size) < avail ? static_cast<size_t>(size) : avail;
+  if (n == 0) { return 0; }
   std::memcpy(buf, s->data + s->pos, n);
   s->pos += n;
   return static_cast<uLong>(n);
@@ -98,13 +99,19 @@ inline zlib_filefunc64_def memory_functions(MemoryStream *s) {
   return f;
 }
 
+// unzOpenCurrentFile and unzReadCurrentFile pass zlib's own error codes
+// through, so the Z_ ones are reasons too.
 inline const char *unzip_message(int code) {
   switch (code) {
   case UNZ_ERRNO: return "I/O error";
   case UNZ_PARAMERROR: return "invalid parameter";
   case UNZ_BADZIPFILE: return "not a ZIP archive, or a damaged one";
-  case UNZ_INTERNALERROR: return "internal error";
+  case UNZ_INTERNALERROR:
+  case Z_STREAM_ERROR: return "internal error";
   case UNZ_CRCERROR: return "the data does not match its CRC";
+  case Z_DATA_ERROR: return "the compressed data is damaged";
+  case Z_BUF_ERROR: return "the compressed data ends early";
+  case Z_MEM_ERROR: return "out of memory";
   default: return "unknown error";
   }
 }
@@ -114,7 +121,9 @@ inline const char *zip_message(int code) {
   case ZIP_ERRNO: return "I/O error";
   case ZIP_PARAMERROR: return "invalid parameter";
   case ZIP_BADZIPFILE: return "not a ZIP archive, or a damaged one";
-  case ZIP_INTERNALERROR: return "internal error";
+  case ZIP_INTERNALERROR:
+  case Z_STREAM_ERROR: return "internal error";
+  case Z_MEM_ERROR: return "out of memory";
   default: return "unknown error";
   }
 }
@@ -124,6 +133,13 @@ inline const char *zip_message(int code) {
 // Writes an archive to a file, or to memory (`open_memory()`, then
 // `buffer()` after `close()`). Every call that can fail returns false and
 // leaves the reason in `error()`.
+//
+// Entries are written as made on Unix, mode 0644 (directories 0755), all
+// dated 1980-02-01 00:00, so the same entries make the same bytes on every
+// host. Unix rather than MS-DOS, because Info-ZIP's unzip takes an MS-DOS
+// name as CP437 and mangles UTF-8 even when the entry is flagged as UTF-8;
+// not 1980-01-01, because a tool shifting it by a time zone can land
+// before the earliest date MS-DOS can hold.
 class Zip {
 public:
   Zip() = default;
@@ -162,25 +178,22 @@ public:
 
     if (dirname.back() != '/') { dirname += '/'; }
 
-    auto ret = zipOpenNewFileInZip64(zfile_, dirname.data(), nullptr, nullptr,
-                                     0, nullptr, 0, nullptr, 0, 0, 0);
-    if (!check(ret)) { return false; }
+    if (!open_entry(dirname, 040755, 0, false)) { return false; }
     return check(zipCloseFileInZip(zfile_));
   }
 
   bool add_file(const std::string &path, const char *data, size_t len) {
     assert(zfile_ && (data || len == 0));
 
-    auto ret = zipOpenNewFileInZip64(
-        zfile_, path.data(), nullptr, nullptr, 0, nullptr, 0, nullptr,
-        Z_DEFLATED, Z_DEFAULT_COMPRESSION, (len > 0xffffffff) ? 1 : 0);
-    if (!check(ret)) { return false; }
+    if (!open_entry(path, 0100644, Z_DEFLATED, len > 0xffffffff)) {
+      return false;
+    }
 
     // zipWriteInFileInZip takes an unsigned int, so a large file goes in
     // pieces.
     while (len > 0) {
       auto n = len > 0x40000000 ? 0x40000000 : len;
-      ret = zipWriteInFileInZip(zfile_, data, static_cast<unsigned int>(n));
+      auto ret = zipWriteInFileInZip(zfile_, data, static_cast<unsigned int>(n));
       if (!check(ret)) {
         zipCloseFileInZip(zfile_);
         return false;
@@ -214,6 +227,19 @@ private:
     return false;
   }
 
+  // `mode` is the Unix st_mode (type and permissions) the entry carries.
+  bool open_entry(const std::string &name, uLong mode, int method, bool zip64) {
+    const uLong made_by_unix = (3 << 8) | 30; // Unix, spec 3.0 as Info-ZIP
+    const uLong dos_1980_02_01 = (0 << 25) | (2 << 21) | (1 << 16);
+    zip_fileinfo info{};
+    info.dosDate = dos_1980_02_01;
+    info.external_fa = (mode << 16) | ((mode & 040000) ? 0x10 : 0);
+    return check(zipOpenNewFileInZip4_64(
+        zfile_, name.data(), &info, nullptr, 0, nullptr, 0, nullptr, method,
+        method ? Z_DEFAULT_COMPRESSION : 0, 0, -MAX_WBITS, DEF_MEM_LEVEL,
+        Z_DEFAULT_STRATEGY, nullptr, 0, made_by_unix, 0, zip64 ? 1 : 0));
+  }
+
   zipFile zfile_ = nullptr;
   detail::MemoryStream stream_;
   std::string buffer_;
@@ -221,9 +247,10 @@ private:
 };
 
 // Reads an archive from a file, or from bytes in memory (`open_memory`,
-// which does not copy them: they must outlive the UnZip). A cursor walks the
-// entries (`next()`, or `locate()` by name); every call that can fail returns
-// false and leaves the reason in `error()`.
+// which does not copy them: they must outlive the UnZip, or be swapped out
+// with `rebind_memory`). A cursor walks the entries (`next()`, or `locate()`
+// by name); every call that can fail returns false and leaves the reason in
+// `error()`.
 class UnZip {
 public:
   UnZip() = default;
@@ -244,7 +271,23 @@ public:
     stream_ = detail::MemoryStream{data, size, nullptr, 0};
     auto funcs = detail::memory_functions(&stream_);
     uzfile_ = unzOpen2_64("", &funcs);
+    in_memory_ = uzfile_ != nullptr;
     return opened("not a ZIP archive, or a damaged one");
+  }
+
+  // Points an archive `open_memory` opened at `data` and `size` from now on,
+  // which should hold the same bytes: what was read of the central directory
+  // is kept. minizip reaches the bytes only through the I/O hooks, seeking
+  // before every read, so nothing still points at the old ones. (nullptr, 0)
+  // lends nothing: reads fail until the next rebind. False, with nothing
+  // changed, for an archive not in memory or while an entry is being read.
+  bool rebind_memory(const char *data, size_t size) {
+    if (!in_memory_ || unztell64(uzfile_) != static_cast<ZPOS64_T>(-1)) {
+      return false;
+    }
+    stream_.data = data;
+    stream_.size = size;
+    return true;
   }
 
   bool is_open() const { return uzfile_ != nullptr; }
@@ -254,6 +297,7 @@ public:
       unzClose(uzfile_);
       uzfile_ = nullptr;
     }
+    in_memory_ = false;
   }
 
   // Reads the current entry, handing its bytes to `cb` as they come.
@@ -316,9 +360,9 @@ public:
 
   bool first() const {
     assert(uzfile_);
-    auto ret = unzGoToFirstFile(uzfile_);
-    if (ret == UNZ_END_OF_LIST_OF_FILE) { return false; }
-    return check(ret);
+    // With no entries minizip would read the end record as one and fail.
+    if (entry_count() == 0) { return false; }
+    return check(unzGoToFirstFile(uzfile_));
   }
 
   bool next() const {
@@ -331,6 +375,12 @@ public:
   // Moves the cursor to the entry named `path` (as written, case and all).
   bool locate(const std::string &path) const {
     assert(uzfile_);
+    // minizip searches only from a cursor on an entry, and a move that
+    // failed (a read error, say) leaves it on none.
+    if (unzGetOffset64(uzfile_) == 0 && entry_count() > 0 &&
+        !check(unzGoToFirstFile(uzfile_))) {
+      return false;
+    }
     auto ret = unzLocateFile(uzfile_, path.data(), 1);
     if (ret == UNZ_END_OF_LIST_OF_FILE) {
       error_ = "no entry " + path;
@@ -374,8 +424,15 @@ private:
     return false;
   }
 
+  ZPOS64_T entry_count() const {
+    unz_global_info64 gi;
+    if (unzGetGlobalInfo64(uzfile_, &gi) != UNZ_OK) { return 0; }
+    return gi.number_entry;
+  }
+
   unzFile uzfile_ = nullptr;
   detail::MemoryStream stream_;
+  bool in_memory_ = false;
   mutable std::string error_;
 };
 

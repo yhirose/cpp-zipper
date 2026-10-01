@@ -80,6 +80,29 @@ if (unzip.locate("hello.txt")) {  // find an entry by name
 }
 ```
 
+An archive opened with `open_memory` can be pointed at other bytes later with
+`rebind_memory(data, size)`, as long as they are the same archive: a caller
+can lend its bytes only for each read and take them back in between with
+`rebind_memory(nullptr, 0)`, during which reads fail instead of touching
+memory. It returns `false` for an archive not opened in memory, or while an
+entry is being read.
+
+```cpp
+zipper::UnZip unzip;
+unzip.open_memory(bytes.data(), bytes.size());
+unzip.rebind_memory(nullptr, 0);  // done with the bytes for now
+// ...
+unzip.rebind_memory(bytes.data(), bytes.size());
+unzip.locate("hello.txt");
+```
+
+Entries
+-------
+
+`Zip` writes every entry as made on Unix with mode `0644` (directories
+`0755`) and dated 1980-02-01 00:00, whatever the host, so the same entries
+always make the same bytes, and `unzip` keeps UTF-8 names as they are.
+
 Errors
 ------
 
